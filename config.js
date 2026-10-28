@@ -5,6 +5,6 @@
  * 비워 두면 체험 모드(예시 단어)로 열려요.
  */
 window.INIVOCA = {
-  appUrl: 'https://script.google.com/macros/s/AKfycb…/exec',
+  appUrl: '',
   pwa: true
 };
