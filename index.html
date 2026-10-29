@@ -231,11 +231,13 @@ var IS_GAS = typeof google !== 'undefined' && google.script && google.script.run
 var CFG = window.INIVOCA || {};
 var APP_URL = /^https:\/\/script\.google\.com\/.+\/exec$/.test(String(CFG.appUrl||'').trim()) ? String(CFG.appUrl).trim() : '';
 var LIVE = IS_GAS || !!APP_URL;
-var CAT_ORDER = ['단어장','부교재','교과서'];
+var CAT_ORDER = ['능률보카 어원편','올림포스 기출편','교과서 편','단어장','부교재','교과서'];
 var TYPES = [
   {id:'en2ko', name:'영 → 한', desc:'영어 단어를 보고 알맞은 뜻 고르기'},
   {id:'ko2en', name:'한 → 영', desc:'뜻을 보고 알맞은 영어 단어 고르기'},
   {id:'cloze', name:'예문 빈칸', desc:'예문 빈칸에 들어갈 단어 고르기 · 수능형'},
+  {id:'clozeSpell', name:'예문 빈칸 쓰기', desc:'예문 빈칸에 알맞은 형태로 직접 쓰기 · 서술형'},
+  {id:'ctx', name:'예문 속 뜻', desc:'예문에 표시된 단어가 쓰인 뜻 고르기 · 다의어'},
   {id:'spell', name:'철자 쓰기', desc:'뜻을 보고 철자 직접 쓰기 · 내신 서술형'},
   {id:'synant', name:'유의어·반의어', desc:'유의어나 반의어 고르기'},
   {id:'mix', name:'혼합', desc:'여러 유형을 섞어서 풀기'}
@@ -272,7 +274,12 @@ function locate(ex, en){
   if(/e$/.test(w)) forms.push(w.slice(0,-1)+'ing', w.slice(0,-1)+'ed');
   if(/y$/.test(w)) forms.push(w.slice(0,-1)+'ies', w.slice(0,-1)+'ied');
   var re = /[A-Za-z][A-Za-z'-]*/g, m;
-  while((m = re.exec(ex))){ if(forms.indexOf(m[0].toLowerCase()) >= 0) return {i:m.index, len:m[0].length}; }
+  while((m = re.exec(ex))){
+    if(forms.indexOf(m[0].toLowerCase()) >= 0) return {i:m.index, len:m[0].length};
+    /* self-confidence, goal-oriented, well-nourished 같은 하이픈 합성어 안의 단어 */
+    var parts = m[0].split('-'), off = 0;
+    for(var k = 0; k < parts.length && parts.length > 1; k++){ if(forms.indexOf(parts[k].toLowerCase()) >= 0) return {i:m.index+off, len:parts[k].length}; off += parts[k].length + 1; }
+  }
   var st = (w.length > 4 && /[ey]$/.test(w)) ? w.slice(0,-1) : w;
   re.lastIndex = 0;
   while((m = re.exec(ex))){ var t = m[0].toLowerCase(); if(t.indexOf(st) === 0 && t.length <= st.length + 4) return {i:m.index, len:m[0].length}; }
@@ -338,7 +345,7 @@ function parseSample(rows){
     if(c.length < 4) return;
     var k = key(c[0], c[1]);
     if(!(k in idx)){ idx[k] = sets.length; sets.push({cat:c[0], unit:c[1], words:[]}); }
-    sets[idx[k]].words.push({en:c[2], ko:c[3], ex:c[4]||'', syn:c[5]||'', ant:c[6]||'', exKo:c[7]||'', der:c[8]||''});
+    sets[idx[k]].words.push({en:c[2], ko:c[3], ex:c[4]||'', syn:c[5]||'', ant:c[6]||'', exKo:c[7]||'', der:c[8]||'', ctx:c[9]||'', trap:c[10]||''});
   });
   return sets;
 }
@@ -395,25 +402,58 @@ function cats(){ var seen={}, out=[]; CAT_ORDER.concat(S.sets.map(function(s){ r
 function levels(){ return store('lv') || {}; }
 function setLevel(en, lv){ var m=levels(); m[en.toLowerCase()]=lv; store('lv', m); }
 function canType(w, t){
-  if(t==='cloze') return !!locate(w.ex, w.en);
+  if(t==='cloze' || t==='clozeSpell' || t==='ctx') return !!locate(w.ex, w.en);
   if(t==='synant') return !!(w.syn || w.ant);
+  if(t==='spell') return /^[A-Za-z][A-Za-z' -]*$/.test(w.en) && !/\s-/.test(w.en);
   return true;
 }
 
 /* ---------- 문제 만들기 ---------- */
+/* keep: 반드시 넣을 함정 선택지, cands: 나머지 후보 */
+function choicesFromKeep(correct, keep, cands){
+  var seen = {}; seen[norm(correct)] = 1; var picked = [];
+  keep.concat(shuffle(cands)).forEach(function(c){ var n = norm(c); if(c && !seen[n] && picked.length < 4){ seen[n] = 1; picked.push(c); } });
+  return shuffle(picked.concat([correct]));
+}
 function choicesFrom(correct, cands){
   var seen = {}; seen[norm(correct)] = 1;
   var picked = [];
   shuffle(cands).forEach(function(c){ var n = norm(c); if(c && !seen[n] && picked.length < 4){ seen[n] = 1; picked.push(c); } });
   return shuffle(picked.concat([correct]));
 }
+/* 뜻풀이를 의미 단위로 나누기: "1 관점, 견해 2 시야; 1 보다" → ["관점, 견해","시야","보다"] */
+function senses(ko){
+  var out = [];
+  String(ko||'').split(/\s\/\s|;/).forEach(function(g){
+    g.split(/(?:^|\s)\d\s+/).forEach(function(x){
+      x = x.replace(/\((?:BrE|AmE)\)\s*/g,'').replace(/^\(\+[^)]*\)\s*/,'').trim();
+      if(x) out.push(x);
+    });
+  });
+  return out;
+}
+function tokens(s){ return String(s||'').replace(/\([^)]*\)|\[[^\]]*\]|…/g,'').split(/[,·]/).map(function(x){ return x.trim(); }).filter(Boolean); }
+/* 같은 말의 품사만 다른 뜻(요청 / 요청하다)은 겹치는 뜻으로 봄 */
+function near(a, b){ var s = function(x){ return x.replace(/(하다|되다|시키다|하게|한|적인|의)$/,''); }; a = s(a); b = s(b); return !!a && !!b && (a.indexOf(b) === 0 || b.indexOf(a) === 0); }
+function ctxOf(w){ return w.ctx || senses(w.ko)[0] || w.ko; }
+/* 뜻이 겹치는 단어(trick·fool = 속이다)는 오답 선택지에서 빼서 정답이 둘이 되지 않게 */
+function koToks(ko){ return String(ko||'').replace(/\([^)]*\)|\[[^\]]*\]|[~…]|\.\.\./g,'').split(/[,;\/·]/).map(function(x){ return x.replace(/\s+/g,''); }).filter(Boolean); }
+function sameMeaning(a, b){ var ta = koToks(a), tb = koToks(b); return ta.some(function(x){ return tb.indexOf(x) >= 0; }); }
 function makeQ(w, t, pool){
-  var others = pool.filter(function(x){ return x.en.toLowerCase() !== w.en.toLowerCase(); });
-  if(others.length < 4){ var extra = allWords().filter(function(x){ return x.en.toLowerCase() !== w.en.toLowerCase(); }); others = others.concat(shuffle(extra)); }
+  var ok = function(x){ return x.en.toLowerCase() !== w.en.toLowerCase() && !sameMeaning(x.ko, w.ko); };
+  var others = pool.filter(ok);
+  if(others.length < 4){ var extra = allWords().filter(ok); others = others.concat(shuffle(extra)); }
   if(t==='en2ko') return {t:t, w:w, answer:w.ko, ch:choicesFrom(w.ko, others.map(function(x){ return x.ko; })), en:false};
   if(t==='ko2en') return {t:t, w:w, answer:w.en, ch:choicesFrom(w.en, others.map(function(x){ return x.en; })), en:true};
   if(t==='cloze') return {t:t, w:w, answer:w.en, ch:choicesFrom(w.en, others.map(function(x){ return x.en; })), en:true};
   if(t==='spell') return {t:t, w:w, answer:w.en, spell:true};
+  if(t==='clozeSpell'){ var p = locate(w.ex, w.en); return {t:t, w:w, answer:w.ex.substr(p.i, p.len), spell:true}; }
+  if(t==='ctx'){
+    var ans = ctxOf(w), at = tokens(ans);
+    /* 단어 탭 '함정 뜻' 칸에 적은 같은 단어의 다른 뜻(다의어)을 함정 선택지로 */
+    var own = shuffle(String(w.trap||'').split(' / ').map(function(x){ return x.trim(); }).filter(function(x){ return x && norm(x) !== norm(ans); })).slice(0, 2);
+    return {t:t, w:w, answer:ans, ch:choicesFromKeep(ans, own, others.map(function(x){ return ctxOf(x); })), en:false};
+  }
   if(t==='synant'){
     var syn = splitList(w.syn), ant = splitList(w.ant);
     var askSyn = syn.length && (!ant.length || Math.random() < 0.5);
@@ -429,7 +469,7 @@ function buildQuiz(words, type, pool){
   var qs = [];
   words.forEach(function(w){
     var t = type;
-    if(type==='mix') t = pick(['en2ko','ko2en','cloze','spell','synant'].filter(function(x){ return canType(w,x); }));
+    if(type==='mix') t = pick(['en2ko','ko2en','cloze','clozeSpell','ctx','spell','synant'].filter(function(x){ return canType(w,x); }));
     var q = makeQ(w, t, pool); if(q) qs.push(q);
   });
   return qs;
@@ -536,6 +576,13 @@ var VIEWS = {
     if(q.t==='en2ko') body = '<span class="qlabel">알맞은 뜻을 고르세요</span><div class="row between"><div class="qword">'+esc(w.en)+'</div>'+(CAN_SPEAK?'<button class="speak" data-act="speak" data-t="'+esc(w.en)+'" aria-label="발음 듣기">'+SPEAK_SVG+'</button>':'')+'</div>';
     if(q.t==='ko2en') body = '<span class="qlabel">뜻에 맞는 단어를 고르세요</span><div class="qko">'+esc(w.ko)+'</div>';
     if(q.t==='cloze') body = '<span class="qlabel">빈칸에 들어갈 단어를 고르세요 <small>(형태 변화 가능)</small></span><p class="qsent">'+exHtml(w.ex, w.en, 'blank')+'</p>';
+    if(q.t==='ctx') body = '<span class="qlabel">표시된 단어가 <b>이 문장에서</b> 쓰인 뜻을 고르세요</span><p class="qsent">'+exHtml(w.ex, w.en)+'</p>';
+    if(q.t==='clozeSpell'){
+      var form = q.answer, fh = form.split('').map(function(c,i){ return i===0 ? c : (c===' ' ? '  ' : '_'); }).join(' ');
+      body = '<span class="qlabel">빈칸에 알맞은 단어를 <b>문장에 맞는 형태로</b> 쓰세요</span><p class="qsent">'+exHtml(w.ex, w.en, 'blank')+'</p>'+
+        (w.exKo ? '<p class="sub">'+esc(w.exKo)+'</p>' : '<p class="sub">뜻: '+esc(w.ko)+'</p>')+
+        '<div class="spellhint">'+esc(fh)+' <small style="letter-spacing:0">('+form.replace(/\s/g,'').length+'글자)</small></div>';
+    }
     if(q.t==='synant') body = '<span class="qlabel">다음 단어의 <b>'+q.rel+'</b>를 고르세요</span><div class="qword">'+esc(w.en)+'</div><p class="sub">'+esc(w.ko)+'</p>';
     if(q.t==='spell'){
       var hint = w.en.split('').map(function(c,i){ return i===0 ? c : (c===' ' ? '  ' : '_'); }).join(' ');
@@ -569,7 +616,7 @@ var VIEWS = {
       '<div class="row">'+(R.retry||R.cat==='오답노트' ? '<span class="pill blue">'+(R.cat==='오답노트'?'오답노트 복습':'재시험')+'</span>' : (pass?'<span class="pill good">통과</span>':'<span class="pill bad">통과 기준 '+S.settings.pass+'점 미달</span>'))+'<span class="sendstate">'+send+'</span></div></div>';
     if(R.wrongQs.length){
       html += '<h2 class="h2">틀린 단어 '+R.wrongQs.length+'개</h2><div class="list">'+R.wrongQs.map(function(q){
-        return '<div class="wrong"><span class="en">'+esc(q.w.en)+'</span><span>'+esc(q.w.ko)+'</span><span class="my">내 답: '+esc(q.given || '(빈칸)')+(q.t==='synant'?' · 정답 '+esc(q.answer):'')+'</span></div>';
+        return '<div class="wrong"><span class="en">'+esc(q.w.en)+'</span><span>'+esc(q.w.ko)+'</span><span class="my">내 답: '+esc(q.given || '(빈칸)')+((q.answer!==q.w.en && q.answer!==q.w.ko)?' · 정답 '+esc(q.answer):'')+'</span></div>';
       }).join('')+'</div>';
       html += '<button class="btn primary wide" data-act="retry">틀린 문제만 다시 풀기</button>';
     } else {
