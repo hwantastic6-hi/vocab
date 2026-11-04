@@ -208,6 +208,18 @@ td.r,th.r{text-align:right;font-variant-numeric:tabular-nums}
 .spin{display:inline-block;width:16px;height:16px;border:2px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-3px}
 @keyframes sp{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}
+/* 자동 발음 · 연속 듣기 */
+.chip{display:inline-flex;align-items:center;gap:6px;border:1.5px solid var(--line);background:var(--surface);border-radius:999px;padding:5px 12px;font-size:13px;font-weight:600;color:var(--muted)}
+.chip svg{width:15px;height:15px;fill:currentColor}
+.chip[aria-pressed="true"]{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}
+.btn svg{width:18px;height:18px;fill:currentColor}
+.flash.still{cursor:default;min-height:230px}
+.ctrl{display:grid;grid-template-columns:1fr 1.5fr 1fr;gap:8px}
+.opt{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 14px;border-top:1px solid var(--line);font-size:14px;font-weight:600}
+.opt:first-child{border-top:0}
+.seg{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end}
+.seg button{border:1.5px solid var(--line);background:var(--surface);border-radius:999px;padding:5px 11px;font-size:13px;font-weight:600}
+.seg button[aria-pressed="true"]{background:var(--ink);border-color:var(--ink);color:var(--bg)}
 @media (max-width:380px){.big2{grid-template-columns:1fr}.stats .v{font-size:19px}}
 </style>
 
@@ -261,7 +273,60 @@ function pad(n){ return (n<10?'0':'') + n; }
 function nowStr(){ var d=new Date(); return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds()); }
 function shortDate(t){ return String(t||'').slice(5,16); }
 function toast(msg){ var t=document.getElementById('toast'); t.textContent=msg; t.hidden=false; clearTimeout(toast._t); toast._t=setTimeout(function(){ t.hidden=true; }, 2200); }
-function speak(text){ if(!CAN_SPEAK) return; try{ speechSynthesis.cancel(); var u=new SpeechSynthesisUtterance(text); u.lang='en-US'; u.rate=0.9; speechSynthesis.speak(u); }catch(e){} }
+function pickVoice(lang){
+  try{
+    var vs = speechSynthesis.getVoices(), p = lang.slice(0,2);
+    return vs.filter(function(v){ return v.lang.replace('_','-') === lang; })[0] || vs.filter(function(v){ return v.lang.toLowerCase().indexOf(p) === 0; })[0] || null;
+  }catch(e){ return null; }
+}
+if(CAN_SPEAK){ try{ speechSynthesis.getVoices(); speechSynthesis.onvoiceschanged = function(){ speechSynthesis.getVoices(); }; }catch(e){} }
+/* 한 문장 읽고 끝나면 done 실행 (기기에서 끝 신호가 안 오면 시간이 지나면 넘어감) */
+function say(text, lang, rate, done){
+  var fired = false, t;
+  function finish(){ if(fired) return; fired = true; clearTimeout(t); if(done) done(); }
+  if(!CAN_SPEAK || !text){ setTimeout(finish, 0); return; }
+  t = setTimeout(finish, 2500 + String(text).length * 260);
+  try{
+    var u = new SpeechSynthesisUtterance(text); u.lang = lang; var v = pickVoice(lang); if(v) u.voice = v;
+    u.rate = rate || 0.9; u.onend = finish; u.onerror = finish; speechSynthesis.speak(u);
+  }catch(e){ finish(); }
+}
+function speak(text){ if(!CAN_SPEAK) return; try{ speechSynthesis.cancel(); }catch(e){} say(text, 'en-US', 0.9); }
+/* 뜻을 소리 내어 읽기 좋게: "1 위로하다 2 편하게 하다; 위안" → "위로하다, 편하게 하다. 위안" */
+function koSpeech(ko){
+  return String(ko||'').replace(/\[[^\]]*\]/g,'').replace(/[()~…]/g,'').replace(/\s*;\s*(\d\s+)?/g,'. ').replace(/^\d\s+/,'').replace(/\s\d\s+/g,', ')
+    .replace(/\s*\/\s*/g,', ').replace(/\s+/g,' ').trim();
+}
+function autoOn(){ return store('autoSpeak') !== false; }
+function autoSay(){ if(autoOn() && S.screen==='study' && S.study && S.study.queue.length) speak(S.study.queue[0].en); }
+
+/* ---------- 연속 듣기 ---------- */
+function lsPref(){ var p = store('lsPref') || {}; return {en: p.en || 1, ko: p.ko !== false, rate: p.rate || 0.9, loop: !!p.loop}; }
+function lsSave(){ var L = S.listen; store('lsPref', {en:L.en, ko:L.ko, rate:L.rate, loop:L.loop}); }
+function lsStop(){ var L = S.listen; if(L){ L.playing = false; L.token++; } if(CAN_SPEAK){ try{ speechSynthesis.cancel(); }catch(e){} } }
+function lsRender(){ if(S.screen==='listen') render(); }
+function lsStep(){
+  var L = S.listen; if(!L || !L.playing) return;
+  var tok = L.token, w = L.list[L.i], seq = [], j = 0;
+  for(var k = 0; k < L.en; k++) seq.push(['en-US', w.en, L.rate]);
+  if(L.ko) seq.push(['ko-KR', koSpeech(w.ko), Math.min(L.rate + 0.1, 1.1)]);
+  (function nx(){
+    if(tok !== L.token || !L.playing) return;
+    if(j >= seq.length){
+      setTimeout(function(){
+        if(tok !== L.token || !L.playing) return;
+        if(L.i + 1 < L.list.length) L.i++;
+        else if(L.loop) L.i = 0;
+        else { L.playing = false; L.done = true; lsRender(); return; }
+        lsRender(); lsStep();
+      }, 1000);
+      return;
+    }
+    var it = seq[j++];
+    say(it[1], it[0], it[2], function(){ setTimeout(nx, 450); });
+  })();
+}
+function lsMove(i){ var L = S.listen, was = L.playing; lsStop(); L.done = false; L.i = Math.max(0, Math.min(L.list.length - 1, i)); if(was){ L.playing = true; lsStep(); } render(); }
 function norm(s){ return String(s||'').toLowerCase().replace(/[’']/g,"'").replace(/\s+/g,' ').trim(); }
 function splitList(s){ return String(s||'').split(/[,;\/]/).map(function(x){ return x.trim(); }).filter(Boolean); }
 
@@ -484,7 +549,7 @@ function startQuiz(opt){
 }
 
 /* ---------- 화면 ---------- */
-function go(screen){ S.screen = screen; render(); window.scrollTo(0,0); }
+function go(screen){ if(S.screen==='listen' && screen!=='listen') lsStop(); S.screen = screen; render(); window.scrollTo(0,0); }
 function renderWho(){
   if(S.screen==='teacher' || S.screen==='tlogin'){ $who.innerHTML = '<span>선생님</span>'; return; }
   if(!S.user){ $who.innerHTML = ''; return; }
@@ -529,6 +594,7 @@ var VIEWS = {
     '<div class="stack" style="gap:4px"><span class="eyebrow">'+esc(s.cat)+'</span><h1 class="h1">'+esc(s.unit)+'</h1><p class="sub">'+s.words.length+'단어 · 알아요 '+known+'개 · 통과 '+S.settings.pass+'점 이상</p></div>'+
     '<div class="big2"><button class="big" data-act="study"><strong>암기하기</strong><span>카드 '+s.words.length+'장 · 모르는 단어 반복</span></button>'+
     '<button class="big primary" data-act="testSetup"><strong>테스트 보기</strong><span>100점 만점 · 결과는 선생님께</span></button></div>'+
+    (CAN_SPEAK ? '<button class="btn wide" data-act="listen">'+SPEAK_SVG+' 연속 듣기 <span style="font-weight:500;color:var(--muted);font-size:13px">· 단어 → 뜻 차례로 읽어 줘요</span></button>' : '')+
     '<div class="row between"><h2 class="h2">단어 목록</h2><div class="legend"><span><i class="dot l1"></i>몰라요</span><span><i class="dot l2"></i>헷갈려요</span><span><i class="dot l3"></i>알아요</span></div></div>'+
     '<div class="list">'+s.words.map(function(w){ var l = lv[w.en.toLowerCase()]; return '<div class="wordrow"><i class="dot'+(l?' l'+l:'')+'"></i><span class="en">'+esc(w.en)+'</span><span class="ko">'+esc(w.ko)+'</span></div>'; }).join('')+'</div>';
   },
@@ -552,11 +618,32 @@ var VIEWS = {
     return '<button class="back" data-act="unit">← '+esc(S.set.unit)+'</button>'+
     '<div class="qhead"><span>'+esc(S.set.cat)+' · '+esc(S.set.unit)+' 암기</span><span class="num">'+done+' / '+st.total+'</span></div>'+
     '<div class="prog"><i style="width:'+pct+'%"></i></div>'+
+    (CAN_SPEAK ? '<button class="chip" data-act="toggleAuto" aria-pressed="'+autoOn()+'" style="align-self:flex-end">'+SPEAK_SVG+'자동 발음 '+(autoOn()?'켜짐':'꺼짐')+'</button>' : '')+
     '<div class="flash" data-act="flip" role="button" tabindex="0" aria-label="카드 뒤집기">'+
       '<div class="flash-head"><div class="hw">'+esc(w.en)+'</div>'+(CAN_SPEAK?'<button class="speak" data-act="speak" data-t="'+esc(w.en)+'" aria-label="발음 듣기">'+SPEAK_SVG+'</button>':'')+'</div>'+
       (st.flipped ? back : '<div class="hint">뜻을 떠올린 다음 카드를 눌러 확인하세요</div>')+
     '</div>'+
     '<div class="rate"><button class="r1" data-act="rate" data-v="1">몰라요</button><button class="r2" data-act="rate" data-v="2">헷갈려요</button><button class="r3" data-act="rate" data-v="3">알아요</button></div>';
+  },
+  listen: function(){
+    var L = S.listen, w = L.list[L.i], n = L.list.length;
+    function seg(k, opts){ return '<div class="seg">'+opts.map(function(o){ return '<button data-act="lsOpt" data-k="'+k+'" data-v="'+o[0]+'" aria-pressed="'+(String(L[k])===String(o[0]))+'">'+o[1]+'</button>'; }).join('')+'</div>'; }
+    return '<button class="back" data-act="unit">← '+esc(S.set.unit)+'</button>'+
+    '<div class="qhead"><span>'+esc(S.set.cat)+' · '+esc(S.set.unit)+' 연속 듣기</span><span class="num">'+(L.i+1)+' / '+n+'</span></div>'+
+    '<div class="prog"><i style="width:'+Math.round((L.i+1)/n*100)+'%"></i></div>'+
+    '<div class="flash still"><div class="hw">'+esc(w.en)+'</div><div class="back-side"><div class="ko-big">'+esc(w.ko)+'</div></div>'+
+      '<div class="hint">'+(L.done ? '단원 끝까지 들었어요. 재생을 누르면 처음부터 다시 들어요.' : (L.playing ? '읽는 중… 화면을 켜 둔 채로 들으세요' : '재생을 누르면 단어와 뜻을 차례로 읽어 줘요'))+'</div></div>'+
+    '<div class="ctrl"><button class="btn" data-act="lsPrev"'+(L.i===0?' disabled':'')+'>◀ 이전</button>'+
+      '<button class="btn primary" data-act="lsPlay">'+(L.playing ? '일시정지' : '재생')+'</button>'+
+      '<button class="btn" data-act="lsNext"'+(L.i===n-1?' disabled':'')+'>다음 ▶</button></div>'+
+    '<div class="list">'+
+      '<div class="opt">영어 읽기'+seg('en', [[1,'1번'],[2,'2번']])+'</div>'+
+      '<div class="opt">뜻 읽기'+seg('ko', [[true,'읽기'],[false,'안 읽기']])+'</div>'+
+      '<div class="opt">속도'+seg('rate', [[0.7,'느리게'],[0.9,'보통'],[1.1,'빠르게']])+'</div>'+
+      '<div class="opt">순서'+seg('shuffle', [[false,'차례대로'],[true,'섞기']])+'</div>'+
+      '<div class="opt">끝나면'+seg('loop', [[false,'멈추기'],[true,'처음부터 반복']])+'</div>'+
+    '</div>'+
+    '<p class="sub">휴대폰 화면이 꺼지면 소리가 멈출 수 있어요. 아이폰은 무음 스위치를 꺼야 소리가 나요.</p>';
   },
   testSetup: function(){
     var s = S.set, n;
@@ -744,7 +831,27 @@ var ACT = {
       .sort(function(a,b){ return order[a.l]-order[b.l] || a.i-b.i; }).map(function(x){ return x.w; });
     var done = {};
     S.study = {queue:q, total:q.length, flipped:false, miss:0, unsure:0, done:done, left:function(){ var u={}; this.queue.forEach(function(w){ u[w.en]=1; }); return Object.keys(u).length; }};
-    go('study');
+    go('study'); autoSay();
+  },
+  toggleAuto: function(){ store('autoSpeak', !autoOn()); render(); if(autoOn()) autoSay(); else if(CAN_SPEAK){ try{ speechSynthesis.cancel(); }catch(e){} } },
+  listen: function(){
+    var p = lsPref();
+    S.listen = {list:S.set.words.slice(), i:0, playing:false, done:false, token:0, shuffle:false, en:p.en, ko:p.ko, rate:p.rate, loop:p.loop};
+    go('listen');
+  },
+  lsPlay: function(){
+    var L = S.listen;
+    if(L.playing){ lsStop(); render(); return; }
+    if(L.done){ L.done = false; L.i = 0; }
+    L.playing = true; L.token++; render(); lsStep();
+  },
+  lsPrev: function(){ lsMove(S.listen.i - 1); },
+  lsNext: function(){ lsMove(S.listen.i + 1); },
+  lsOpt: function(d){
+    var L = S.listen, k = d.k, v = d.v;
+    var val = (v==='true') ? true : (v==='false') ? false : Number(v);
+    if(k==='shuffle'){ var was = L.playing; lsStop(); L.shuffle = val; L.list = val ? shuffle(S.set.words) : S.set.words.slice(); L.i = 0; L.done = false; if(was){ L.playing = true; lsStep(); } render(); return; }
+    L[k] = val; lsSave(); render();
   },
   flip: function(){ S.study.flipped = !S.study.flipped; render(); },
   speak: function(d){ speak(d.t); },
@@ -753,7 +860,7 @@ var ACT = {
     setLevel(w.en, v);
     if(v===1){ st.miss++; st.queue.splice(Math.min(2, st.queue.length), 0, w); }
     if(v===2){ st.unsure++; st.queue.splice(Math.min(5, st.queue.length), 0, w); }
-    st.flipped = false; render();
+    st.flipped = false; render(); autoSay();
   },
   testSetup: function(){ go('testSetup'); },
   startTest: function(d){ startQuiz({words:S.set.words, type:d.t, pool:S.set.words, cat:S.set.cat, unit:S.set.unit}); },
